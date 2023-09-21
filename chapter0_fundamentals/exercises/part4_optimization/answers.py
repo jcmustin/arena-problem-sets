@@ -348,7 +348,7 @@ if MAIN:
 
     plot_fn_with_points(pathological_curve_loss, points=points)
 
-# %%
+
 # %% (comparing optimizers on gaussian)
 if MAIN:
     points = []
@@ -409,7 +409,7 @@ if MAIN:
     )
 
 
-# %%
+# %% (ResNetTrainingArgs)
 @dataclass
 class ResNetTrainingArgs():
     batch_size: int = 64
@@ -420,7 +420,7 @@ class ResNetTrainingArgs():
     subset: int = 10
 
 
-# %%
+# %% (ResNetTrainer)
 class ResNetTrainer:
     def __init__(self, args: ResNetTrainingArgs):
         self.args = args
@@ -478,14 +478,14 @@ class ResNetTrainer:
             self.logged_variables["accuracy"].append(accuracy.item())
 
 
-# %%
+# %% (train ResNet)
 args = ResNetTrainingArgs()
 trainer = ResNetTrainer(args)
 trainer.train()
 plot_train_loss_and_test_accuracy_from_trainer(trainer, title="Training ResNet on MNIST data")
 
 
-# %%
+# %% (test_resnet_on_random_input)
 def test_resnet_on_random_input(model: ResNet34, n_inputs: int = 3):
     indices = np.random.choice(len(cifar_trainset), n_inputs).tolist()
     classes = [cifar_trainset.classes[cifar_trainset.targets[i]] for i in indices]
@@ -513,4 +513,112 @@ def test_resnet_on_random_input(model: ResNet34, n_inputs: int = 3):
 
 
 test_resnet_on_random_input(trainer.model)
-# %%
+
+
+# %% wandb init
+import wandb
+wandb.login()
+
+
+# %% ResNetTrainerWandb
+dataclass
+class ResNetTrainingArgsWandb(ResNetTrainingArgs):
+    wandb_project: Optional[str] = 'day4-resnet'
+    wandb_name: Optional[str] = None
+
+class ResNetTrainerWandb(ResNetTrainer):
+    def __init__(self, args: ResNetTrainingArgsWandb):
+        self.args = args
+        self.model = get_resnet_for_feature_extraction(args.n_classes).to(device)
+        self.optimizer = args.optimizer(self.model.out_layers[-1].parameters(), lr=args.learning_rate)
+        self.trainset, self.testset = get_cifar(subset=args.subset)
+        self.step = 0
+        wandb.init(project=args.wandb_project, name=args.wandb_name)
+        wandb.watch(self.model)
+
+    def training_step(self, imgs: Tensor, labels: Tensor) -> t.Tensor:
+        logits, labels = self._shared_train_val_step(imgs, labels)
+        loss = F.cross_entropy(logits, labels)
+        loss.backward()
+        self.optimizer.step()
+        self.optimizer.zero_grad()
+        self.step += 1
+        return loss
+
+    def train(self):
+        progress_bar = tqdm(total=self.args.epochs * len(self.trainset) // self.args.batch_size)
+        accuracy = t.nan
+
+        for epoch in range(self.args.epochs):
+
+            # Training loop (includes updating progress bar)
+            for imgs, labels in self.train_dataloader():
+                loss = self.training_step(imgs, labels)
+                wandb.log({'loss': loss.item()})
+                desc = f"Epoch {epoch+1}/{self.args.epochs}, Loss = {loss:.2f}, Accuracy = {accuracy:.2f}"
+                progress_bar.set_description(desc)
+                progress_bar.update()
+
+            # Compute accuracy by summing n_correct over all batches, and dividing by number of items
+            accuracy = sum(self.validation_step(imgs, labels) for imgs, labels in self.val_dataloader()) / len(self.testset)
+
+            wandb.log({'accuracy': accuracy.item()})
+        wandb.finish()
+ 
+
+args = ResNetTrainingArgsWandb()
+trainer = ResNetTrainerWandb(args)
+trainer.train()
+
+
+# %% sweep_config
+
+if MAIN:
+    sweep_config = {
+        'method': 'random',
+        'name': 'sweep',
+        'metric': {
+            'goal': 'maximize', 
+            'name': 'accuracy'
+        },
+        'parameters': {
+            'learning_rate': {
+                'distribution': 'log_uniform_values',
+                'min': 0.0001,
+                'max': 0.1,
+            },
+            'batch_size': {'values': [32, 64, 128, 256]},
+            'epochs': {'values': [1, 2, 3]},
+        }
+    }
+    tests.test_sweep_config(sweep_config)
+
+
+# %% train with sweep config
+# (2) Define a training function which takes no arguments, and uses `wandb.config` to get hyperparams
+from dataclasses import replace 
+
+
+class ResNetTrainerWandbSweeps(ResNetTrainerWandb):
+    def __init__(self, args: ResNetTrainingArgsWandb):
+        wandb.init(project=args.wandb_project, name=args.wandb_name)
+        replace(args, **wandb.config)
+        self.args = args
+        self.model = get_resnet_for_feature_extraction(args.n_classes).to(device)
+        self.optimizer = args.optimizer(self.model.out_layers[-1].parameters(), lr=args.learning_rate)
+        self.trainset, self.testset = get_cifar(subset=args.subset)
+        self.step = 0
+        wandb.watch(self.model)
+
+
+def train():
+    args = ResNetTrainingArgsWandb()
+    trainer = ResNetTrainerWandbSweeps(args)
+    trainer.train()
+
+
+if MAIN:
+    sweep_id = wandb.sweep(sweep=sweep_config, project='day4-resnet-sweep')
+    wandb.agent(sweep_id=sweep_id, function=train, count=3)
+    wandb.finish()
+
