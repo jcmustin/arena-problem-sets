@@ -9,6 +9,7 @@ from transformer_lens.utils import gelu_new, tokenize_and_concatenate
 import torch as t
 from torch import Tensor
 import torch.nn as nn
+import torch.nn.functional as F
 import numpy as np
 import math
 from tqdm.notebook import tqdm
@@ -36,11 +37,12 @@ if str(exercises_dir) not in sys.path: sys.path.append(str(exercises_dir))
 from plotly_utils import imshow
 # import part1_transformer_from_scratch.solutions as solutions
 
-device = t.device("mps")
+device = t.device("cuda" if t.cuda.is_available() else "cpu")
 
 MAIN = __name__ == '__main__'
 
 reference_gpt2 = HookedTransformer.from_pretrained("gpt2-small", fold_ln=False, center_unembed=False, center_writing_weights=False)
+# %% === CLEAN TRANSFORMER IMPLEMENTATION ===
 # %% (sorted vocab exploration)
 sorted_vocab = sorted(list(reference_gpt2.tokenizer.vocab.items()), key=lambda n: n[1])
 print(sorted_vocab[:20])
@@ -303,7 +305,7 @@ rand_float_test(Unembed, [2, 4, 768])
 load_gpt2_test(Unembed, reference_gpt2.unembed, cache["ln_final.hook_normalized"])
 
 
-# %% DemoTransformer
+# %% Full Transformer
 class DemoTransformer(nn.Module):
     def __init__(self, cfg: Config):
         super().__init__()
@@ -323,4 +325,159 @@ class DemoTransformer(nn.Module):
 
 rand_int_test(DemoTransformer, [2, 4])
 load_gpt2_test(DemoTransformer, reference_gpt2, tokens)
+# %% (get_log_probs)
+def get_log_probs(
+    logits: Float[Tensor, "batch posn d_vocab"], 
+    tokens: Int[Tensor, "batch posn"]
+) -> Float[Tensor, "batch posn-1"]:
 
+    log_probs = logits.log_softmax(dim=-1)
+    # Get logprobs the first seq_len-1 predictions (so we can compare them with the actual next tokens)
+    log_probs_for_tokens = log_probs[:, :-1].gather(dim=-1, index=tokens[:, 1:].unsqueeze(-1)).squeeze(-1)
+
+    return log_probs_for_tokens
+
+
+# %% === TRAINING A TRANSFORMER ===
+# %% (create model)
+model_cfg = Config(
+    debug=False, 
+    d_model=256, 
+    n_heads=4, 
+    d_head=64, 
+    d_mlp=1024, 
+    n_layers=2, 
+    n_ctx=256, 
+    d_vocab=reference_gpt2.cfg.d_vocab
+)
+model = DemoTransformer(model_cfg)
+
+
+# %% (TransformerTrainingArgs)
+dataclass
+class TransformerTrainingArgs():
+    batch_size = 16
+    epochs = 10
+    max_steps_per_epoch = 200
+    lr = 1e-3
+    weight_decay = 1e-2
+    wandb_project: Optional[str] = "day1-demotransformer"
+    wandb_name: Optional[str] = None
+
+
+args = TransformerTrainingArgs()
+
+
+# %% (create data)
+dataset = datasets.load_dataset("NeelNanda/pile-10k", split="train").remove_columns("meta")
+print(dataset)
+print(dataset[0]['text'][:100])
+
+tokenized_dataset = tokenize_and_concatenate(dataset, reference_gpt2.tokenizer, streaming=False, max_length=model.cfg.n_ctx, column_name="text", add_bos_token=True, num_proc=4)
+
+dataset_dict = tokenized_dataset.train_test_split(test_size=1000)
+train_loader = DataLoader(dataset_dict["train"], batch_size=args.batch_size, shuffle=True, num_workers=4, pin_memory=True)
+test_loader = DataLoader(dataset_dict["test"], batch_size=args.batch_size, shuffle=False, num_workers=4, pin_memory=True)
+
+first_batch = train_loader.dataset[:args.batch_size]
+
+print(first_batch.keys())
+print(first_batch['tokens'].shape)
+
+
+# %% wandb init
+wandb.login()
+# %% TransformerTrainer
+class TransformerTrainer:
+    def __init__(self, args: TransformerTrainingArgs, model: DemoTransformer):
+        super().__init__()
+        self.model = model
+        self.args = args
+        self.optimizer = t.optim.AdamW(self.model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+        self.step = 0
+        wandb.init(project=args.wandb_project, name=args.wandb_name)
+        wandb.watch(self.model)
+
+
+    def training_step(self, batch: Dict[str, Int[Tensor, "batch seq"]]) -> Float[Tensor, ""]:
+        '''
+        Calculates the loss on the tokens in the batch, performs a gradient update step, and logs the loss.
+
+        Remember that `batch` is a dictionary with the single key 'tokens'.
+        '''
+        # YOUR CODE HERE
+        tokens = batch['tokens'].to(device)
+        predictions = self.model(tokens)
+
+        # tokens_one_hot = F.one_hot(tokens, num_classes=self.model.cfg.d_vocab).float()
+        # # note: I think cross entropy is the correct choice rather than nll_loss,
+        # # since Unembed in DemoTransformer doesn't run softmax on the output.
+        # loss = F.cross_entropy(predictions[:, :-1, :], tokens_one_hot[:, 1:, :])
+
+        # edit: I must've mis-implemented the commented code above,
+        # because I'm getting different results than get_log_probs. Not yet sure why.
+
+        loss = -get_log_probs(predictions, tokens).mean()
+        loss.backward()
+        self.optimizer.step()
+        self.optimizer.zero_grad()
+        wandb.log({'loss': loss.item()}, step=self.step)
+        return loss
+
+    @t.inference_mode()
+    def validation_step(self, batch: Dict[str, Int[Tensor, "batch seq"]]):
+        '''
+        Calculates & returns the accuracy on the tokens in the batch (i.e. how often the model's prediction
+        is correct). Logging should happen in the `train` function (after we've computed the accuracy for 
+        the whole validation set).
+        '''
+        # YOUR CODE HERE
+        tokens = batch['tokens'].to(device)
+        predictions = self.model(tokens)[:, :-1].argmax(dim=-1)
+        return (predictions==tokens[:, 1:]).reshape(-1).float()
+
+    def train(self):
+        '''
+        Trains the model, for `self.args.epochs` epochs. Also handles wandb initialisation, and early stopping
+        for each epoch at `self.args.max_steps_per_epoch` steps.
+        '''
+        # YOUR CODE HERE
+        progress_bar = tqdm(total = self.args.max_steps_per_epoch * self.args.epochs)
+
+        accuracy = 0
+
+        for epoch in range(self.args.epochs):
+            for step, batch in enumerate(self.train_loader()):
+                if step > self.args.max_steps_per_epoch:
+                    break
+                loss = self.training_step(batch)
+                progress_bar.update()
+                progress_bar.set_description(f"Epoch {epoch+1}, loss: {loss:.3f}, accuracy: {accuracy:.2f}")
+                self.step += 1
+            accuracy = t.cat([self.validation_step(batch) for batch in self.test_loader()]).mean().item()
+            wandb.log({'accuracy': accuracy}, step=self.step)
+
+    def train_loader(self) -> DataLoader:
+        '''Returns train loader (as in code above).'''
+        return DataLoader(dataset_dict["train"], batch_size=self.args.batch_size, shuffle=True, num_workers=4, pin_memory=True)
+
+    def test_loader(self) -> DataLoader:
+        '''Returns test loader (as in code above).'''
+        return DataLoader(dataset_dict["test"], batch_size=self.args.batch_size, shuffle=False, num_workers=4, pin_memory=True)
+
+
+# %% (train)
+model = DemoTransformer(model_cfg).to(device)
+args = TransformerTrainingArgs()
+trainer = TransformerTrainer(args, model)
+trainer.train()
+
+
+# %%
+text = "I'm going to take over the world"
+tokens = reference_gpt2.to_tokens(text).to(device)
+logits = model(tokens).argmax(dim=-1)
+print(list(zip(reference_gpt2.to_str_tokens(tokens)[1:], reference_gpt2.to_str_tokens(logits)[:-1])))
+# %%
+print(type(text))
+# %%
